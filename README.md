@@ -1,5 +1,5 @@
 # integration_data_ingestion_accelerator
-This repositroy contains ready to use code for ingesting data from external systems into AWS Native Services- RedShift
+This repository contains ready to use code for ingesting data from external systems into AWS Native Services- RedShift
 Main components of this repo are 
 1) Architecture Diagram
 2) Lambda Code
