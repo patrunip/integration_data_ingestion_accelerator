@@ -21,4 +21,3 @@ def lambda_handler(event, context):
             }
         )
         print(f"Glue Job started: {response['JobRunId']}")
-
