@@ -1,1 +1,20 @@
+import boto3
 
+s3 = boto3.client('s3')
+DEST_BUCKET = 'staginglayer-data'
+
+def lambda_handler(event, context):
+    for record in event['Records']:
+        src_bucket = record['s3']['bucket']['name']
+        src_key = record['s3']['object']['key']
+
+        print(f"New file detected: {src_key} in {src_bucket}")
+
+        # Download the file from Bucket A
+        response = s3.get_object(Bucket=src_bucket, Key=src_key)
+        file_data = response['Body'].read()
+
+        # Upload to Bucket B (triggers Lambda 2)
+        s3.put_object(Bucket=DEST_BUCKET, Key=src_key, Body=file_data)
+
+        print(f"Uploaded {src_key} from {src_bucket} to {DEST_BUCKET}")
