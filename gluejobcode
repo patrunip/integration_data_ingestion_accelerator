@@ -1,1 +1,189 @@
+import sys
+import boto3
+import os
+import tarfile
+import tempfile
+import csv
+import psycopg2
+from urllib.parse import urlparse
+
+# -----------------------------
+# Helper functions
+# -----------------------------
+def get_arg(name):
+    if f"--{name}" in sys.argv:
+        return sys.argv[sys.argv.index(f"--{name}") + 1]
+    else:
+        raise ValueError(f"Missing required argument: --{name}")
+
+def parse_s3_path(s3_path):
+    parsed = urlparse(s3_path)
+    return parsed.netloc, parsed.path.lstrip('/')
+
+def download_file(s3_client, bucket, key, download_path):
+    print(f"Downloading from s3://{bucket}/{key} to {download_path}")
+    s3_client.download_file(bucket, key, download_path)
+
+def extract_tar(tar_path, extract_dir):
+    print(f"Extracting {tar_path} to {extract_dir}")
+    with tarfile.open(tar_path, 'r') as tar:
+        tar.extractall(path=extract_dir)
+
+def upload_to_s3(s3_client, local_dir, bucket, dest_prefix):
+    uploaded_keys = []
+    for root, _, files in os.walk(local_dir):
+        for file in files:
+            if file == 'archive.tar':
+                continue
+            local_path = os.path.join(root, file)
+            relative_path = os.path.relpath(local_path, local_dir)
+            s3_key = os.path.join(dest_prefix, relative_path).replace("\\", "/")
+            print(f"Uploading {local_path} to s3://{bucket}/{s3_key}")
+            s3_client.upload_file(local_path, bucket, s3_key)
+            uploaded_keys.append((file, f"s3://{bucket}/{s3_key}"))
+    return uploaded_keys
+
+def parse_metadata(metadata_path):
+    table_name = None
+    columns = []
+
+    with open(metadata_path, mode='r', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            extract_value = row.get('extract')
+            column_name = row.get('column_name')
+            data_type = row.get('type')
+            length = row.get('length')
+
+            if not table_name and extract_value:
+                table_name = extract_value.split('.')[-1]
+
+            if not column_name or not data_type:
+                continue
+
+            # Redshift type mapping
+            data_type = data_type.strip().lower()
+            if data_type == 'string':
+                redshift_type = f'VARCHAR({length or 256})'
+            elif data_type == 'longtext':
+                redshift_type = f'VARCHAR({length or 64000})'
+            elif data_type == 'datetime':
+                redshift_type = 'TIMESTAMP'
+            elif data_type == 'number':
+                redshift_type = 'FLOAT'
+            else:
+                redshift_type = 'VARCHAR(256)'
+
+            columns.append(f'"{column_name}" {redshift_type}')
+
+    if not table_name:
+        raise Exception("Table name could not be determined from metadata.")
+
+    create_stmt = f'CREATE TABLE IF NOT EXISTS {table_name} (\n  {", ".join(columns)}\n);'
+    return table_name, create_stmt
+
+def create_table_if_not_exists(conn, create_stmt):
+    with conn.cursor() as cursor:
+        cursor.execute(create_stmt)
+        conn.commit()
+
+def copy_to_redshift(conn, table_name, s3_data_path, iam_role):
+    copy_stmt = f"""
+        COPY {table_name}
+        FROM '{s3_data_path}'
+        IAM_ROLE '{iam_role}'
+        FORMAT AS CSV
+        QUOTE '\"'
+        IGNOREHEADER 1
+        TIMEFORMAT 'auto'
+        ACCEPTINVCHARS
+        BLANKSASNULL
+        EMPTYASNULL;
+    """
+    print(f"Running COPY command for table {table_name}")
+    with conn.cursor() as cursor:
+        cursor.execute(copy_stmt)
+        conn.commit()
+
+# -----------------------------
+# Main Glue Job Function
+# -----------------------------
+def main():
+    # Input arguments
+    s3_input_path = get_arg('S3_INPUT_PATH')
+    # Hardcoded Redshift connection details
+    redshift_host = "loaddatafroms3glue.******.us-east-1.redshift.amazonaws.com"
+    redshift_port = 5439
+    redshift_db = "dev"
+    redshift_user = "aws****"
+    redshift_password = "pass***$"
+    iam_role = "arn:aws:iam::089928012499:role/RedshiftS3CopyRole"
+    #iam_role = "arn:aws:iam::089928012499:role/GlueS3RedshiftRole"
+
+    bucket, key = parse_s3_path(s3_input_path)
+    base_filename = os.path.basename(key).replace('.tar', '')
+    dest_prefix = f'application1/unzipped/{base_filename}/'
+
+    s3_client = boto3.client('s3')
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        tar_path = os.path.join(temp_dir, 'archive.tar')
+
+        # Step 1: Download tar
+        download_file(s3_client, bucket, key, tar_path)
+
+        # Step 2: Extract tar
+        extract_tar(tar_path, temp_dir)
+
+        # Step 3: Identify metadata and data files
+        metadata_path = None
+        data_file_path = None
+
+        for file in os.listdir(temp_dir):
+            full_path = os.path.join(temp_dir, file)
+            if file.lower() == 'metadata.csv':
+                metadata_path = full_path
+            elif file.endswith('.csv'):
+                data_file_path = full_path
+
+        if not metadata_path or not data_file_path:
+            raise Exception("Both metadata.csv and data file are required in the archive.")
+
+        # Step 4: Parse metadata
+        table_name, create_stmt = parse_metadata(metadata_path)
+
+        # Step 5: Connect to Redshift and create table
+        conn = psycopg2.connect(
+            host=redshift_host,
+            port=redshift_port,
+            dbname=redshift_db,
+            user=redshift_user,
+            password=redshift_password
+        )
+
+        try:
+            create_table_if_not_exists(conn, create_stmt)
+
+            # Step 6: Upload files to S3
+            uploaded = upload_to_s3(s3_client, temp_dir, bucket, dest_prefix)
+            data_file_s3_path = None
+            for fname, s3_path in uploaded:
+                if fname != 'metadata.csv':
+                    data_file_s3_path = s3_path
+                    break
+
+            if not data_file_s3_path:
+                raise Exception("Data file could not be uploaded.")
+
+            # Step 7: Copy to Redshift
+            copy_to_redshift(conn, table_name, data_file_s3_path, iam_role)
+
+        finally:
+            conn.close()
+
+    print(f"Glue job complete. Data loaded into Redshift table: {table_name}")
+
+# -----------------------------
+if __name__ == "__main__":
+    main()
 
