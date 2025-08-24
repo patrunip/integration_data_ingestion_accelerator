@@ -1,1 +1,24 @@
+aimport boto3
+
+glue = boto3.client('glue')
+GLUE_JOB_NAME = 'loaddatatoredshift'
+
+def lambda_handler(event, context):
+    for record in event['Records']:
+        s3_bucket = record['s3']['bucket']['name']
+        s3_key = record['s3']['object']['key']
+        
+        # Optional filter for .tar files
+        if not s3_key.endswith('.tar'):
+            print(f"Skipping non-tar file: {s3_key}")
+            continue
+        print(f"Lambda is sending: s3://{s3_bucket}/{s3_key}")
+        print(f"Triggering Glue Job for: {s3_key}")
+        response = glue.start_job_run(
+            JobName=GLUE_JOB_NAME,
+            Arguments={
+                '--S3_INPUT_PATH': f's3://{s3_bucket}/{s3_key}'
+            }
+        )
+        print(f"Glue Job started: {response['JobRunId']}")
 
